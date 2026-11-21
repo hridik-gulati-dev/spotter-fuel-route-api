@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Fuel Route Planner</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; }
+    #panel { padding: 12px 16px; background: #f7f7f7; border-bottom: 1px solid #ddd; }
+    #panel input { width: 260px; padding: 6px; margin-right: 8px; }
+    #panel button { padding: 6px 14px; }
+    #summary { margin-top: 8px; font-size: 14px; white-space: pre-line; }
+    #map { height: 78vh; }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <form id="f">
+      <input id="start" placeholder="Start, e.g. New York, NY" required>
+      <input id="finish" placeholder="Finish, e.g. Miami, FL" required>
+      <button type="submit">Plan route</button>
+    </form>
+    <div id="summary"></div>
+  </div>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([39.5, -98.35], 4);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    let layer = null;
+
+    // Google/OSRM encoded-polyline decoder (5-decimal precision)
+    function decode(str) {
+      let i = 0, lat = 0, lon = 0; const pts = [];
+      while (i < str.length) {
+        let b, shift = 0, result = 0;
+        do { b = str.charCodeAt(i++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+        lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+        shift = 0; result = 0;
+        do { b = str.charCodeAt(i++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+        lon += (result & 1) ? ~(result >> 1) : (result >> 1);
+        pts.push([lat / 1e5, lon / 1e5]);
+      }
+      return pts;
+    }
+
+    // Optional auto-run: /map/?start=...&finish=... fills and submits.
+    const q = new URLSearchParams(location.search);
+    if (q.get('start') && q.get('finish')) {
+      document.getElementById('start').value = q.get('start');
+      document.getElementById('finish').value = q.get('finish');
+      setTimeout(() => document.getElementById('f').requestSubmit(), 300);
+    }
+
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const summary = document.getElementById('summary');
+      summary.textContent = 'Planning...';
+      const resp = await fetch('/api/route-fuel/', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          start: document.getElementById('start').value,
+          finish: document.getElementById('finish').value,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) { summary.textContent = 'Error: ' + (data.error || resp.status); return; }
+
+      if (layer) map.removeLayer(layer);
+      layer = L.layerGroup();
+      if (data.route_polyline_direct) {
+        L.polyline(decode(data.route_polyline_direct), {weight: 2, opacity: 0.45, dashArray: '6 6'}).addTo(layer);
+      }
+      const pts = decode(data.route_polyline);
+      L.polyline(pts, {weight: 4}).addTo(layer);
+      L.marker(pts[0]).addTo(layer).bindPopup('Start: ' + data.start.resolved);
+      L.marker(pts[pts.length - 1]).addTo(layer).bindPopup('Finish: ' + data.finish.resolved);
+      const src = data.starting_fuel.price_source;
+      const srcTxt = src && src.kind === 'station_valuation' ? `starting fuel valued at ${src.name}, ${src.city}, ${src.state} @$${src.price_per_gallon}/gal (${src.coord_source})` : 'starting fuel priced by caller';
+      const money = `total money spent: $${data.total_money_spent} (cash $${data.cash_paid_en_route} en route + starting fuel consumed; ${srcTxt})`;
+      const lines = [`Distance: ${data.total_distance_miles} mi direct / ${data.total_driven_miles} mi driven via stops | Fuel burned: ${data.fuel_consumed_gallons} gal | Bought at pumps: ${data.fuel_purchased_gallons} gal | ${money} | starts with ${data.starting_fuel.gallons} gal in tank | ${data.range_check}`];
+      data.fuel_purchases.forEach((s, i) => {
+        const label = 'Stop ' + (i + 1);
+        L.marker([s.approx_lat, s.approx_lon]).addTo(layer).bindPopup(
+          `<b>${label}: ${s.name}</b><br>${s.address}, ${s.city}, ${s.state}` +
+          `${s.fuel_before_gallons} gal in tank + ${s.gallons_purchased} gal = ${s.fuel_after_gallons} gal<br>$${s.price_per_gallon}/gal x ${s.gallons_purchased} gal = $${s.cost}` +
+          `<br>driven mile ${s.route_mile} (leg ${s.leg_miles} mi), location: ${s.coord_source}`);
+        lines.push(`${label} (mile ${s.route_mile}): ${s.name}, ${s.city}, ${s.state} - tank ${s.fuel_before_gallons} + ${s.gallons_purchased} gal = ${s.fuel_after_gallons} gal at $${s.price_per_gallon}/gal, $${s.cost}`);
+      });
+      if (data.fuel_purchases.length === 0) lines.push('No fuel stops needed - the full starting tank covers the whole route; $0 spent at pumps.');
+      layer.addTo(map);
+      map.fitBounds(L.polyline(pts).getBounds(), {padding: [30, 30]});
+      summary.textContent = lines.join('\n');
+    });
+  </script>
+</body>
+</html>
